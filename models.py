@@ -9,6 +9,9 @@ import copy
 from pathlib import Path
 from optimizer import IIPG
 from skimage.metrics import structural_similarity as ssim_func
+import matplotlib.pyplot as plt
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
 
 DEFAULT_OPTS = {'kernel_size':11,
                 'features_in':1,
@@ -30,7 +33,32 @@ DEFAULT_OPTS = {'kernel_size':11,
                 'error_scale':10,
                 'loss_weight':1}
 
+# ======= 请将这段代码添加到 models.py 中 VariationalNetwork 类的上方 =======
 
+def tf_symmetric_pad(x, pad):
+    """精确复现 TensorFlow 的 SYMMETRIC 填充"""
+    # 处理高 (H)
+    x = torch.cat([x[:, :, 0:pad].flip(2), x, x[:, :, -pad:].flip(2)], dim=2)
+    # 处理宽 (W)
+    x = torch.cat([x[:, :, :, 0:pad].flip(3), x, x[:, :, :, -pad:].flip(3)], dim=3)
+    return x
+
+@torch.no_grad()
+def apply_proximal_maps(model):
+    for cell in model.cell_list:
+        cell.lamb.clamp_(min=0.0)
+
+        k = cell.conv_kernel
+        # 1. 独立计算实部和虚部的均值并减去 (剔除 dim=4)
+        k_mean = k.mean(dim=(1, 2, 3), keepdim=True)
+        k.sub_(k_mean)
+        
+        # 2. 结合实部和虚部计算复数总范数 (保留 dim=(1,2,3,4))
+        norm = torch.sqrt(torch.sum(k**2, dim=(1, 2, 3, 4), keepdim=True))
+        scale = torch.clamp(norm, min=1.0)
+        k.div_(scale)
+
+# =========================================================================
 
 class RBFActivationFunction(torch.autograd.Function):
     @staticmethod
@@ -88,8 +116,8 @@ class RBFActivation(nn.Module):
         self.options = kwargs
         x_0 = np.linspace(kwargs['vmin'],kwargs['vmax'],kwargs['num_act_weights'],dtype=np.float32)
         mu = np.linspace(kwargs['vmin'],kwargs['vmax'],kwargs['num_act_weights'],dtype=np.float32)
-        self.sigma = 2*kwargs['vmax']/(kwargs['num_act_weights'] - 1)
-        self.sigma = torch.tensor(self.sigma)
+        grid_spacing = (kwargs['vmax'] - kwargs['vmin']) / (kwargs['num_act_weights'] - 1)
+        self.sigma = torch.tensor(grid_spacing, dtype=torch.float32)
         if kwargs['init_type'] == 'linear':
             w_0 = kwargs['init_scale']*x_0
         elif kwargs['init_type'] == 'tv':
@@ -117,8 +145,8 @@ class RBFActivation(nn.Module):
         # weighted_gaussian = self.w_0 * gaussian
         # out = torch.sum(weighted_gaussian,axis=-1,keepdim=False)
         if not self.mu.device == x.device:
-        	self.mu = self.mu.to(x.device)
-        	self.sigma = self.sigma.to(x.device)
+            self.mu = self.mu.to(x.device)
+            self.sigma = self.sigma.to(x.device)
 
         # out = torch.zeros(x.shape,dtype=torch.float32,device=x.device)
         # for i in range(self.options['num_act_weights']):
@@ -237,8 +265,8 @@ class VnMriReconCell(nn.Module):
         u_t_real = u_t_1[:,:,:,:,0]
         u_t_imag = u_t_1[:,:,:,:,1]
         
-        u_t_real = F.pad(u_t_real,[pad,pad,pad,pad],mode='reflect') #to do: implement symmetric padding
-        u_t_imag = F.pad(u_t_imag,[pad,pad,pad,pad],mode='reflect')
+        u_t_real = tf_symmetric_pad(u_t_real, pad)
+        u_t_imag = tf_symmetric_pad(u_t_imag, pad)
         # split the image in real and imaginary part and perform convolution
         u_k_real = F.conv2d(u_t_real,self.conv_kernel[:,:,:,:,0],stride=1,padding=5)
         u_k_imag = F.conv2d(u_t_imag,self.conv_kernel[:,:,:,:,1],stride=1,padding=5)
@@ -286,6 +314,9 @@ class VariationalNetwork(pl.LightningModule):
 
         self.cell_list = nn.Sequential(*cell_list)
         self.log_img_count = 0
+
+        self.step_metrics = {'loss': [], 'mse': [], 'ssim': [], 'psnr': []}
+        self.epoch_history = {'loss': [], 'mse': [], 'ssim': [], 'psnr': []}
 
         import os
         self.mse_history = []
@@ -381,21 +412,129 @@ class VariationalNetwork(pl.LightningModule):
 
         return {'loss': total_loss}
 
-    def test_step(self, batch, batch_idx):
-        recon_img = self(batch)
-        ref_img = batch['reference']
-        h_recon, w_recon = recon_img.shape[1], recon_img.shape[2]
-        h_ref, w_ref = ref_img.shape[1], ref_img.shape[2]
-        h_start = (h_recon - h_ref) // 2
-        w_start = (w_recon - w_ref) // 2
-        recon_img = recon_img[:, h_start:h_start+h_ref, w_start:w_start+w_ref, :]
-        recon_img_mag = torch_abs(recon_img)
-        ref_img_mag = torch_abs(ref_img)
-        loss = F.mse_loss(recon_img_mag,ref_img_mag)
-        img_save_dir = Path(self.options['save_dir']) / ('eval_result_img_' + self.options['name'])
-        img_save_dir.mkdir(parents=True,exist_ok=True)
-        save_recon(batch['u_t'],recon_img,ref_img,batch_idx,img_save_dir,self.options['error_scale'],True)
-        return {'test_loss':loss}
+
+
+    # 修改 models.py 中的 training_step
+    def training_step(self, batch, batch_idx):
+        recon_img = self(batch)       # 形状: [B, H_recon, W_recon, 2]
+        ref_img = batch['reference']  # 形状: [B, H_ref, W_ref, 2]
+        
+        # 1. 计算复数模长
+        recon_mag = torch.sqrt(recon_img[..., 0]**2 + recon_img[..., 1]**2 + 1e-12) # [B, 640, 320]
+        ref_mag = torch.sqrt(ref_img[..., 0]**2 + ref_img[..., 1]**2 + 1e-12)       # [B, 320, 320]
+        
+        # ==============================================================
+        # 新增：动态中心裁剪逻辑，将 640 裁剪至与标签相同的 320，防止过采样导致的尺寸报错
+        # ==============================================================
+        if recon_mag.shape[1] != ref_mag.shape[1]:
+            diff_h = recon_mag.shape[1] - ref_mag.shape[1]
+            start_h = diff_h // 2
+            end_h = start_h + ref_mag.shape[1]
+            recon_mag = recon_mag[:, start_h:end_h, :]
+
+        if recon_mag.shape[2] != ref_mag.shape[2]:
+            diff_w = recon_mag.shape[2] - ref_mag.shape[2]
+            start_w = diff_w // 2
+            end_w = start_w + ref_mag.shape[2]
+            recon_mag = recon_mag[:, :, start_w:end_w]
+        # ==============================================================
+
+        # 2. 计算 Loss (此时维度完美对齐 [B, 320, 320])
+        spatial_loss = torch.sum((recon_mag - ref_mag) ** 2, dim=(1, 2))
+        loss = torch.mean(spatial_loss) * self.options['loss_weight']
+        
+        # 3. 将 Tensor 转换为 Numpy 以计算图像指标 (下方的 NumPy 计算也同步安全了)
+        r_np = recon_mag.detach().cpu().numpy()
+        t_np = ref_mag.detach().cpu().numpy()
+        
+        batch_mse, batch_ssim, batch_psnr = 0.0, 0.0, 0.0
+        B = r_np.shape[0]
+        for i in range(B):
+            r_img = r_np[i]
+            t_img = t_np[i]
+            drange = t_img.max() - t_img.min()
+            if drange == 0: drange = 1.0 
+            
+            batch_mse += np.mean((r_img - t_img)**2)
+            batch_ssim += ssim(t_img, r_img, data_range=drange)
+            batch_psnr += psnr(t_img, r_img, data_range=drange)
+            
+        self.step_metrics['loss'].append(loss.item())
+        self.step_metrics['mse'].append(batch_mse / B)
+        self.step_metrics['ssim'].append(batch_ssim / B)
+        self.step_metrics['psnr'].append(batch_psnr / B)
+
+        # 后面原有的图片记录保持不变...
+
+        # 5. TensorBoard 原有图片记录逻辑
+        if batch_idx % (int(200/self.options['batch_size']/4)) == 0:
+            sample_img = save_recon(batch['u_t'],recon_img,ref_img,batch_idx,'save_dir',self.options['error_scale'],False)
+            sample_img = sample_img[np.newaxis,:,:]
+            self.logger.experiment.add_image('sample_recon',sample_img.astype(np.uint8),self.log_img_count)
+            self.log_img_count += 1
+
+        tensorboard_logs = {'train_loss': loss}
+        return {'loss': loss, 'log': tensorboard_logs}
+    
+    def on_epoch_end(self):
+        """每个 Epoch 结束时，汇总平均指标，并更新曲线图"""
+        if len(self.step_metrics['loss']) == 0:
+            return
+            
+        # 汇总当前 Epoch 的平均指标
+        self.epoch_history['loss'].append(np.mean(self.step_metrics['loss']))
+        self.epoch_history['mse'].append(np.mean(self.step_metrics['mse']))
+        self.epoch_history['ssim'].append(np.mean(self.step_metrics['ssim']))
+        self.epoch_history['psnr'].append(np.mean(self.step_metrics['psnr']))
+        
+        # 清空 step 记录，为下一个 Epoch 做准备
+        self.step_metrics = {'loss': [], 'mse': [], 'ssim': [], 'psnr': []}
+        
+        # 生成并保存四联图
+        self.plot_training_curves()
+
+    def plot_training_curves(self):
+        """生成 Loss, MSE, SSIM, PSNR 四张并排的曲线图"""
+        epochs = range(1, len(self.epoch_history['loss']) + 1)
+        fig, axs = plt.subplots(1, 4, figsize=(24, 5))
+
+        # 1. Loss 曲线
+        axs[0].plot(epochs, self.epoch_history['loss'], 'b-', linewidth=2)
+        axs[0].set_title('Loss Curve', fontsize=16)
+        axs[0].set_xlabel('Epoch', fontsize=14)
+        axs[0].grid(True, linestyle='--', alpha=0.7)
+
+        # 2. MSE 曲线
+        axs[1].plot(epochs, self.epoch_history['mse'], 'r-', linewidth=2)
+        axs[1].set_title('MSE', fontsize=16)
+        axs[1].set_xlabel('Epoch', fontsize=14)
+        axs[1].grid(True, linestyle='--', alpha=0.7)
+
+        # 3. SSIM 曲线
+        axs[2].plot(epochs, self.epoch_history['ssim'], 'g-', linewidth=2)
+        axs[2].set_title('SSIM', fontsize=16)
+        axs[2].set_xlabel('Epoch', fontsize=14)
+        axs[2].grid(True, linestyle='--', alpha=0.7)
+
+        # 4. PSNR 曲线
+        axs[3].plot(epochs, self.epoch_history['psnr'], 'm-', linewidth=2)
+        axs[3].set_title('PSNR', fontsize=16)
+        axs[3].set_xlabel('Epoch', fontsize=14)
+        axs[3].grid(True, linestyle='--', alpha=0.7)
+
+        plt.tight_layout()
+        
+        # 图片将保存在你的 exp/basic_varnet 目录下
+        save_path = Path(self.options['save_dir']) / 'metrics_curves.png'
+        plt.savefig(save_path, dpi=150)
+        plt.close(fig)
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """
+        PyTorch Lightning 钩子：在每个 Batch 的梯度反向传播和优化器 step() 之后自动调用。
+        此时参数刚刚被 Adam/SGD 篡改，我们需要立刻把它们拉回约束空间。
+        """
+        apply_proximal_maps(self)
 
     def test_epoch_end(self, outputs):
         test_loss_mean = torch.stack([x['test_loss'] for x in outputs]).mean()
@@ -421,4 +560,3 @@ class VariationalNetwork(pl.LightningModule):
             return {
                 "optimizer": iipg_optimizer
             }
-
